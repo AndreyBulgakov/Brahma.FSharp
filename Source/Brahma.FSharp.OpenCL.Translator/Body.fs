@@ -18,22 +18,27 @@ module Brahma.FSharp.OpenCL.Translator.Body
 open Microsoft.FSharp.Quotations
 open Brahma.FSharp.OpenCL.AST
 open Microsoft.FSharp.Collections
+open System.Collections.Generic
 
 let private clearContext (targetContext:TargetContext<'a,'b>) =
     let c = new TargetContext<'a,'b>()
     c.Namer <- targetContext.Namer
     c.Flags <- targetContext.Flags
+    c.UserDefinedTypes.AddRange(targetContext.UserDefinedTypes)
+    for kvp in targetContext.UserDefinedTypesOpenCLDeclaration do c.UserDefinedTypesOpenCLDeclaration.Add (kvp.Key,kvp.Value)
     c
 
-let dummyTypes = new System.Collections.Generic.Dictionary<_,Struct<_>>()
+
+
+let mutable dictionaryFun = new System.Collections.Generic.Dictionary<string,StatementBlock<Lang>>()
 
 let rec private translateBinding (var:Var) newName (expr:Expr) (targetContext:TargetContext<_,_>) =    
     let body,tContext = (*TranslateAsExpr*) translateCond expr targetContext    
     let vType = 
         match (body:Expression<_>) with 
         | :? Const<Lang> as c -> c.Type
-        | :? ArrayInitializer<Lang> as ai -> Type.Translate var.Type false dummyTypes (Some ai.Length)
-        | _ -> Type.Translate var.Type false dummyTypes None
+        | :? ArrayInitializer<Lang> as ai -> Type.Translate var.Type false (Some ai.Length) targetContext
+        | _ -> Type.Translate var.Type false None targetContext
     new VarDecl<Lang>(vType,newName,Some body)
 
 and private translateCall exprOpt (mInfo:System.Reflection.MethodInfo) _args targetContext =
@@ -54,7 +59,9 @@ and private translateCall exprOpt (mInfo:System.Reflection.MethodInfo) _args tar
     | "op_unarynegation"       -> new Unop<_>(UOp.Minus,args.[0]) :> Statement<_>,tContext
     | "op_modulus"             -> new Binop<_>(Remainder,args.[0],args.[1]) :> Statement<_>,tContext
     | "op_bitwiseand"          -> new Binop<_>(BitAnd,args.[0],args.[1]) :> Statement<_>,tContext
-    | "op_bitwiseor"          -> new Binop<_>(BitOr,args.[0],args.[1]) :> Statement<_>,tContext
+    | "op_bitwiseor"           -> new Binop<_>(BitOr,args.[0],args.[1]) :> Statement<_>,tContext
+    | "op_leftshift"           -> new Binop<_>(LeftShift,args.[0],args.[1]) :> Statement<_>,tContext
+    | "op_rightshift"          -> new Binop<_>(RightShift,args.[0],args.[1]) :> Statement<_>,tContext
     | "op_lessbangplusgreater"
     | "op_lessbangplus"        -> 
         tContext.Flags.enableAtomic <- true
@@ -67,11 +74,31 @@ and private translateCall exprOpt (mInfo:System.Reflection.MethodInfo) _args tar
     | "op_lessbang"           -> 
         tContext.Flags.enableAtomic <- true
         new FunCall<_>("atom_xchg",[new Pointer<_>(args.[0]);args.[1]]) :> Statement<_>,tContext 
+    | "amax" | "amaxr"        -> 
+        tContext.Flags.enableAtomic <- true
+        new FunCall<_>("atom_max",[new Pointer<_>(args.[0]);args.[1]]) :> Statement<_>,tContext 
+    | "amin" | "aminr"        -> 
+        tContext.Flags.enableAtomic <- true
+        new FunCall<_>("atom_min",[new Pointer<_>(args.[0]);args.[1]]) :> Statement<_>,tContext 
+    | "aincr" | "aincrr"      -> 
+        tContext.Flags.enableAtomic <- true
+        new FunCall<_>("atom_inc",[new Pointer<_>(args.[0])]) :> Statement<_>,tContext 
+    | "adecr" | "adecrr"      -> 
+        tContext.Flags.enableAtomic <- true
+        new FunCall<_>("atom_dec",[new Pointer<_>(args.[0])]) :> Statement<_>,tContext 
+    | "acompexch" | "acompexchr"      -> 
+        tContext.Flags.enableAtomic <- true
+        new FunCall<_>("atom_cmpxchg",[new Pointer<_>(args.[0]);args.[1];args.[2]]) :> Statement<_>,tContext 
+    
     | "todouble"               -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.Float)):> Statement<_>,tContext
     | "toint"                  -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.Int)):> Statement<_>,tContext
-    | "toint16"                  -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.Short)):> Statement<_>,tContext
+    | "toint16"                -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.Short)):> Statement<_>,tContext
     | "tosingle"               -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.Float)):> Statement<_>,tContext
-    | "tobyte"               -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.UChar)):> Statement<_>,tContext
+    | "tobyte"                 -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.UChar)):> Statement<_>,tContext
+    | "touint32"               -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.UInt)):> Statement<_>,tContext
+    | "touint16"               -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.UShort)):> Statement<_>,tContext
+    | "toint64"                -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.Long)):> Statement<_>,tContext
+    | "touint64"               -> new Cast<_>( args.[0],new PrimitiveType<_>(PTypes<_>.ULong)):> Statement<_>,tContext
     | "acos" | "asin" | "atan"
     | "cos" | "cosh" | "exp"
     | "floor" | "log" | "log10"
@@ -131,7 +158,12 @@ and private transletaPropGet exprOpt (propInfo:System.Reflection.PropertyInfo) e
     | "item" -> 
         let idx,tContext,hVar = itemHelper exprs hostVar targetContext
         new Item<_>(hVar,idx) :> Expression<_>, tContext
-    | x -> failwithf "Unsupported property in kernel: %A"  x
+    | x -> 
+        match exprOpt with
+        | Some expr -> 
+            let r,tContext = translateFieldGet expr propInfo.Name targetContext
+            r :> Expression<_>, tContext
+        | None -> failwithf "Unsupported property in kernel: %A"  x
 
 and private transletaPropSet exprOpt (propInfo:System.Reflection.PropertyInfo) exprs newVal targetContext =    
     let hostVar = exprOpt |> Option.map(fun e -> TranslateAsExpr e targetContext)
@@ -139,10 +171,15 @@ and private transletaPropSet exprOpt (propInfo:System.Reflection.PropertyInfo) e
     match propInfo.Name.ToLowerInvariant() with
     | "item" -> 
         let idx,tContext,hVar = itemHelper exprs hostVar tContext
-        let item = new Item<_>(hVar,idx)        
+        let item = new Item<_>(hVar,idx)
         new Assignment<_>(new Property<_>(PropertyType.Item(item)),newVal) :> Statement<_>
         , tContext
-    | x -> failwithf "Unsupported property in kernel: %A"  x  
+    | x ->
+        match exprOpt with
+        | Some e -> 
+            let r,tContext = translateFieldSet e propInfo.Name exprs.[0] targetContext
+            r :> Statement<_>,tContext 
+        | None -> failwithf "Unsupported property in kernel: %A"  x  
 
 and TranslateAsExpr expr (targetContext:TargetContext<_,_>) =
     let (r:Node<_>),tc = Translate expr (targetContext:TargetContext<_,_>)
@@ -151,19 +188,23 @@ and TranslateAsExpr expr (targetContext:TargetContext<_,_>) =
 and getVar (clVarName:string) (targetContext:TargetContext<_,_>) =
     new Variable<_>(clVarName)
 
-and translateVar (var:Var) (targetContext:TargetContext<_,_>) =
+and translateVar (var:Var) (targetContext:TargetContext<_,_>) =    
+    //getVar var.Name targetContext
     let vName = targetContext.Namer.GetCLVarName var.Name
     match vName with
     | Some n -> getVar n targetContext
-    | None -> failwith "Seems, that you try to use variable, that declared out of quotation. Please, pass it as quoted function's parametaer."
+    | None ->         
+            sprintf "Seems, that you try to use variable with name %A, that declared out of quotation." var.Name
+          + "Please, pass it as quoted function's parametaer."
+          |> failwith 
 
-and translateValue (value:obj) (sType:System.Type) =
+and translateValue (value:obj) (sType:System.Type) targetContext =
     let mutable _type = None
     let v =
         let s = string value 
         match sType.Name.ToLowerInvariant() with
         | "boolean" -> 
-            _type <- Type.Translate sType false dummyTypes None |> Some
+            _type <- Type.Translate sType false None targetContext |> Some
             if s.ToLowerInvariant() = "false" then "0" else "1"
         | t when t.EndsWith "[]" ->            
             let arr =
@@ -172,11 +213,11 @@ and translateValue (value:obj) (sType:System.Type) =
                 | "byte[]" -> value :?> array<byte> |> Array.map string
                 | "single[]" -> value :?> array<float32> |> Array.map string
                 | _ -> failwith "Unsupported array type."
-            _type <- Type.Translate sType false dummyTypes (Some arr.Length) |> Some
+            _type <- Type.Translate sType false (Some arr.Length) targetContext |> Some
             arr |> String.concat ", "
             |> fun s -> "{ " + s + "}" 
         | _ -> 
-            _type <- Type.Translate sType false dummyTypes None |> Some
+            _type <- Type.Translate sType false None targetContext |> Some
             s
     new Const<_>(_type.Value, v)
 
@@ -265,34 +306,89 @@ and translateSeq expr1 expr2 (targetContext:TargetContext<_,_>) =
     stmt, tContext
 
 and translateApplication expr1 expr2 targetContext =
+    let rec go expr _vals args  = 
+        match expr with
+        | Patterns.Lambda (v,e) ->
+            go e _vals (v::args) 
+        | Patterns.Application (e1,e2) ->
+            go e1 (e2::_vals) args
+        | e ->
+            if _vals.Length = args.Length then
+                let d =
+                    List.zip (List.rev args) _vals |> dict
+            
+                    //failwith "Partial evaluation is not supported in kernel function."
+                e.Substitute (fun v -> if d.ContainsKey v then Some d.[v] else None) ,true
+            else e, false
+    let body, doing = go expr1 [expr2] []
+    body, doing, targetContext
+    //if(body = null) then
+    //    translateApplicationFun expr1 expr2 targetContext
+    //else
+    
+                //else 
+                //let getStatementFun = dictionaryFun.[expr.
+                    //new FunCall<_>(expr.ToString(), _vals) :> Statement<_>,targetContext
+                    //failwith "-Partial evaluation is not supported in kernel function."
+
+and translateApplicationFun expr1 expr2 targetContext =
     let rec go expr _vals args = 
         match expr with
         | Patterns.Lambda (v,e) ->
             go e _vals (v::args)
         | Patterns.Application (e1,e2) ->
-            go e1 (e2::_vals) args
+            let exp, tc = (TranslateAsExpr (e2) targetContext)
+            go e1 (exp::_vals) args
         | e ->
-            let d =
-                if _vals.Length = args.Length
-                then List.zip (List.rev args) _vals |> dict
-                else failwith "Partial evaluation is not supported in kernel function."
-            e.Substitute (fun v -> if d.ContainsKey v then Some d.[v] else None)
-    let body = go expr1 [expr2] []
-    Translate body targetContext
+            let listArg = List.rev _vals
+            let funCall = new FunCall<_>(expr.ToString(), _vals) :> Statement<_>
+            funCall, targetContext
+                //failwith "-Partial evaluation is not supported in kernel function."
+    let exp, tc = (TranslateAsExpr (expr2) targetContext)
+    go expr1 [exp] []
+
+and translateFieldSet host (*fldInfo:System.Reflection.FieldInfo*) name _val context =
+    let hostE, tc = TranslateAsExpr host context
+    let field = name//fldInfo.Name
+    let valE, tc = TranslateAsExpr _val tc
+    let res = new FieldSet<_>(hostE, field, valE)
+    res, tc
+
+and translateFieldGet host (*fldInfo:System.Reflection.FieldInfo*)name context =
+    let hostE, tc = TranslateAsExpr host context
+    let field = name//fldInfo.Name
+    let res = new FieldGet<_>(hostE,field)
+    res, tc
 
 and Translate expr (targetContext:TargetContext<_,_>) =
     //printfn "%A" expr
     match expr with
     | Patterns.AddressOf expr -> "AdressOf is not suported:" + string expr|> failwith
     | Patterns.AddressSet expr -> "AdressSet is not suported:" + string expr|> failwith
-    | Patterns.Application (expr1,expr2) -> translateApplication expr1 expr2 targetContext
+    | Patterns.Application (expr1,expr2) -> 
+        let e, appling, targetContext = translateApplication expr1 expr2 targetContext
+        if(appling) then
+            Translate e targetContext
+        else
+            let r, tContext= translateApplicationFun expr1 expr2 targetContext
+            r :> Node<_>,tContext
     | Patterns.Call (exprOpt,mInfo,args) -> 
         let r,tContext = translateCall exprOpt mInfo args targetContext
         r :> Node<_>,tContext
     | Patterns.Coerce(expr,sType) -> "Coerce is not suported:" + string expr|> failwith
     | Patterns.DefaultValue sType -> "DefaulValue is not suported:" + string expr|> failwith
-    | Patterns.FieldGet (exprOpt,fldInfo) -> "FieldGet is not suported:" + string expr|> failwith
-    | Patterns.FieldSet (exprOpt,fldInfo,expr) -> "FieldSet is not suported:" + string expr|> failwith
+    | Patterns.FieldGet (exprOpt,fldInfo) -> 
+        match exprOpt with
+        | Some expr -> 
+            let r,tContext = translateFieldGet expr fldInfo.Name targetContext
+            r :> Node<_>,tContext
+        | None -> failwithf "FieldGet for empty host is not suported. Field: " fldInfo.Name
+    | Patterns.FieldSet (exprOpt,fldInfo,expr) ->
+        match exprOpt with
+        | Some e -> 
+            let r,tContext = translateFieldSet e fldInfo.Name expr targetContext
+            r :> Node<_>,tContext
+        | None -> failwithf "Fileld set with empty host is not supported. Field: %A" fldInfo
     | Patterns.ForIntegerRangeLoop (i, from, _to, _do) ->
         let r,tContext = translateForIntegerRangeLoop i from _to _do targetContext
         r :> Node<_>, tContext
@@ -300,7 +396,7 @@ and Translate expr (targetContext:TargetContext<_,_>) =
         let r,tContext = translateIf cond thenExpr elseExpr targetContext
         r :> Node<_>, tContext
     | Patterns.Lambda (var,_expr) -> 
-        //translateLambda var expr targetContext
+       // translateLambda var expr targetContext
         "Lambda is not suported:" + string expr|> failwith
     | Patterns.Let (var, expr, inExpr) ->
         translateLet var expr inExpr targetContext
@@ -308,7 +404,16 @@ and Translate expr (targetContext:TargetContext<_,_>) =
     | Patterns.LetRecursive (bindings,expr) -> "LetRecursive is not suported:" + string expr|> failwith
     | Patterns.NewArray(sType,exprs) -> "NewArray is not suported:" + string expr|> failwith
     | Patterns.NewDelegate(sType,vars,expr) -> "NewDelegate is not suported:" + string expr|> failwith
-    | Patterns.NewObject(constrInfo,exprs) -> "NewObject is not suported:" + string expr|> failwith
+    | Patterns.NewObject(constrInfo,exprs) ->
+        let p = constrInfo.GetParameters()
+        let p2 = constrInfo.GetMethodBody()
+        if targetContext.UserDefinedTypes.Contains(constrInfo.DeclaringType)
+        then
+            let structInfo =  targetContext.UserDefinedTypesOpenCLDeclaration.[constrInfo.DeclaringType.Name.ToLowerInvariant()]
+            let cArgs = exprs |> List.map (fun x -> TranslateAsExpr x targetContext)
+            let res = new NewStruct<_>(structInfo,cArgs |> List.unzip |> fst)
+            res :> Node<_>,targetContext
+        else "NewObject is not suported:" + string expr|> failwith
     | Patterns.NewRecord(sType,exprs) -> "NewRecord is not suported:" + string expr|> failwith
     | Patterns.NewTuple(exprs) -> "NewTuple is not suported:" + string expr|> failwith
     | Patterns.NewUnionCase(unionCaseinfo,exprs) -> "NewUnionCase is not suported:" + string expr|> failwith
@@ -327,7 +432,7 @@ and Translate expr (targetContext:TargetContext<_,_>) =
     | Patterns.TupleGet(expr,i) -> "TupleGet is not suported:" + string expr|> failwith
     | Patterns.TypeTest(expr,sType) -> "TypeTest is not suported:" + string expr|> failwith
     | Patterns.UnionCaseTest(expr,unionCaseInfo) -> "UnionCaseTest is not suported:" + string expr|> failwith
-    | Patterns.Value(_obj,sType) -> translateValue _obj sType :> Node<_>, targetContext 
+    | Patterns.Value(_obj,sType) -> translateValue _obj sType  targetContext :> Node<_> , targetContext 
     | Patterns.Var var -> translateVar var targetContext :> Node<_>, targetContext
     | Patterns.VarSet(var,expr) -> 
         let res,tContext = translateVarSet var expr targetContext
@@ -355,10 +460,10 @@ and private translateLet var expr inExpr (targetContext:TargetContext<_,_>) =
     targetContext.VarDecls.Add vDecl    
     targetContext.Namer.LetIn var.Name    
     let sb = new ResizeArray<_>(targetContext.VarDecls |> Seq.cast<Statement<_>>)
-    let res,tContext = clearContext targetContext |> Translate inExpr
+    let res,tContext = clearContext targetContext |> Translate inExpr //вот тут мб нужно проверять на call или application
     match res with
-    | :? StatementBlock<Lang> as s -> sb.AddRange s.Statements;
-    | _ -> sb.Add (res :?> Statement<_>)
+    | :? StatementBlock<Lang> as s -> sb.AddRange s.Statements; 
+    | _ -> sb.Add (res :?> Statement<_>)                       
      
    
     targetContext.Namer.LetOut()

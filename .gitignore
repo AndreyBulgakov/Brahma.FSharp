@@ -11,5 +11,9 @@ YMNIK/*
 NuGet/*.nupkg
 Source/packages/*
 Brahman/OpenCL/packages/*
+Source/ArrayFunctions/packages/*
 Source/Fractals/FractalsGPU/packages/*
 !Source/Fractals/FractalsGPU/packages/*.config
+
+_ReSharper.*
+packages

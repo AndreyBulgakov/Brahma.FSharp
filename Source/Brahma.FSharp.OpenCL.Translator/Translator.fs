@@ -17,15 +17,17 @@ namespace Brahma.FSharp.OpenCL.Translator
 
 open Microsoft.FSharp.Quotations
 open  Brahma.FSharp.OpenCL.AST
+open System.Collections.Generic
+open Brahma.FSharp.OpenCL.Translator.Type
 
 type FSQuotationToOpenCLTranslator() =
    
-    let dummyTypes = new System.Collections.Generic.Dictionary<_,_>()
-
     let CollectStructs e =
+        let escapeNames = [|"_1D";"_2D";"_3D"|]
         let structs = new System.Collections.Generic.Dictionary<System.Type, _> () 
         let  add (t:System.Type) =
-            if ((t.IsValueType && not t.IsPrimitive && not t.IsEnum) || t.Name.StartsWith "Tuple`") && not (structs.ContainsKey(t))
+            if ((t.IsValueType && not t.IsPrimitive && not t.IsEnum)) && not (structs.ContainsKey t) 
+               && not (Array.exists ((=)t.Name) escapeNames )
             then structs.Add(t, ())
         let rec go (e: Expr) = 
             add e.Type
@@ -38,7 +40,6 @@ type FSQuotationToOpenCLTranslator() =
         go e
         structs
 
-    
     /// The parameter 'vars' is an immutable map that assigns expressions to variables
     /// (as we recursively process the tree, we replace all known variables)
     let rec expand vars expr = 
@@ -67,55 +68,113 @@ type FSQuotationToOpenCLTranslator() =
           expand (Map.add v (expand vars assign) vars) body
       | _ -> expanded
 
+    let addReturn subAST = 
+        let rec adding (stmt:Statement<'lang>) =
+            match stmt with
+            | :? StatementBlock<'lang> as sb -> 
+                let listStaments = sb.Statements
+                let lastStatement = listStaments.[listStaments.Count - 1]
+                sb.Remove (listStaments.Count - 1)             
+                sb.Append(adding lastStatement)
+                sb :> Statement<_>
+            | :? Expression<'lang> as ex -> (new Return<_>(ex)) :> Statement<_>
+            | :? IfThenElse<'lang> as ite -> 
+                let newThen = (adding (ite.Then)) :?> StatementBlock<_>
+                let newElse =
+                    if(ite.Else = None) then
+                        None
+                    else
+                        Some((adding (ite.Else.Value)) :?> StatementBlock<_> )
+                (new IfThenElse<_>(ite.Condition,newThen, newElse)) :> Statement<_>
+            | _ -> failwithf "Unsapported statement to add Return: %A" stmt
 
-    let mainKernelName = "brahmaKernel"
+        adding subAST
+
+
+    let mutable newAST = new ResizeArray<Method>()
     let brahmaDimensionsTypes = ["_1d";"_2d";"_3d"]
     let brahmaDimensionsTypesPrefix = "brahma.opencl."
     let bdts = brahmaDimensionsTypes |> List.map (fun s -> brahmaDimensionsTypesPrefix + s)
-    let buildFullAst vars partialAst (context:TargetContext<_,_>) =
-        let formalArgs = 
-            vars |> List.filter (fun (v:Var) -> bdts |> List.exists((=) (v.Type.FullName.ToLowerInvariant())) |> not)
-            |> List.map 
-                (fun v -> 
-                    let t = Type.Translate v.Type true dummyTypes None
-                    new FunFormalArg<_>(t :? RefType<_> , v.Name, t))
-        let mainKernelFun = new FunDecl<_>(true, mainKernelName, new PrimitiveType<_>(Void), formalArgs,partialAst)
-        let pragmas = 
-            let res = new ResizeArray<_>()
-            if context.Flags.enableAtomic then
-                res.Add(new CLPragma<_>(CLGlobalInt32BaseAtomics) :> TopDef<_> )
-                res.Add(new CLPragma<_>(CLLocalInt32BaseAtomics) :> TopDef<_> )
-            List.ofSeq res
-        new AST<_>(pragmas @ [mainKernelFun])
+    let buildFullAst (varsList:ResizeArray<_>) types (partialAstList:ResizeArray<_>) (contextList:ResizeArray<TargetContext<_,_>>) =
+        let mutable listCLFun = []
+        for i in 0..(varsList.Count-1) do
+            let formalArgs = 
+                varsList.[i] |> List.filter (fun (v:Var) -> bdts |> List.exists((=) (v.Type.FullName.ToLowerInvariant())) |> not)
+                |> List.map 
+                    (fun v -> 
+                        let t = Type.Translate v.Type true None (contextList.[i])
+                        new FunFormalArg<_>(t :? RefType<_> , v.Name, t))
+            let nameFun:Var = ((newAST.[i]).FunVar)
+            let mutable retFunType = new PrimitiveType<_>(Void) :> Type<_>
+            if i <> varsList.Count-1 then
+                let typeFun = newAST.[i].FunVar.Type                
+                retFunType <- Type.Translate typeFun  false  None (contextList.[i])
+            let typeRet = retFunType :?> PrimitiveType<_>
+            let partAST, isKernel = 
+                if typeRet.Type <> PTypes.Void
+                then addReturn partialAstList.[i], false
+                else partialAstList.[i], true
+
+            let mainKernelFun = new FunDecl<_>(isKernel, nameFun.Name, retFunType, formalArgs,partAST)
+            
+            let pragmas = 
+                let res = new ResizeArray<_>()
+                if contextList.[i].Flags.enableAtomic
+                then
+                    res.Add(new CLPragma<_>(CLGlobalInt32BaseAtomics) :> TopDef<_>)
+                    res.Add(new CLPragma<_>(CLLocalInt32BaseAtomics) :> TopDef<_>)
+                if contextList.[i].Flags.enableFP64
+                then res.Add(new CLPragma<_>(CLFP64))
+                List.ofSeq res
+            listCLFun <- pragmas@types@listCLFun@[mainKernelFun]
+        new AST<_>(listCLFun)
 
     let translate qExpr translatorOptions =
+        
         let structs = CollectStructs qExpr
-        let translatedStructs = structs.Keys |> Seq.map (Type.TransleteStructDecl dummyTypes)
+        let context = new TargetContext<_,_>()
+        let translatedStructs = Type.TransleteStructDecls structs.Keys context |> Seq.cast<_> |> List.ofSeq
+        newAST <- QuotationsTransformer.quontationTransformer qExpr translatorOptions
+
         //let qExpr = expand Map.empty qExpr
-        let rec go expr vars =
+        let rec go expr vars  =
             match expr with
-            | Patterns.Lambda (v, body) -> go body (v::vars)
+            | Patterns.Lambda (v, body) -> go body (v::vars) 
             | e -> 
                 let body =
                     let b,context =
-                        let context = new TargetContext<_,_>()
-                        context.Namer.LetIn()
-                        context.TranslatorOptions.AddRange translatorOptions
-                        vars |> List.iter (fun v -> context.Namer.AddVar v.Name)
-                        let newE = e |> QuotationsTransformer.inlineLamdas |> QuotationsTransformer.apply
-                        printfn "%A" e
-                        Body.Translate newE context
+                        let c = new TargetContext<_,_>()
+                        c.UserDefinedTypes.AddRange context.UserDefinedTypes
+                        c.UserDefinedTypesOpenCLDeclaration.Clear()
+                        for x in context.UserDefinedTypesOpenCLDeclaration do c.UserDefinedTypesOpenCLDeclaration.Add (x.Key,x.Value)
+                        c.Flags.enableFP64 <- context.Flags.enableFP64
+                        c.Namer.LetIn()
+                        c.TranslatorOptions.AddRange translatorOptions
+                        vars |> List.iter (fun v -> c.Namer.AddVar v.Name)
+                        //printfn "%A" e
+                        Body.Translate e c
                     match b  with
                     | :? StatementBlock<Lang> as sb -> sb
                     | :? Statement<Lang> as s -> new StatementBlock<_>(new ResizeArray<_>([s]))
                     | _ -> failwithf "Incorrect function body: %A" b
-                    ,context 
+                    ,context
                 vars, body
-
             | x -> "Incorrect OpenCL quotation: " + string x |> failwith
-        let vars,(partialAst,context) = go qExpr []
-        buildFullAst (List.rev vars) (partialAst :> Statement<_>) context
+        
+        let listPartsASTVars = new ResizeArray<_>()
+        let listPartsASTPartialAst = new ResizeArray<_>()
+        let listPartsASTContext = new ResizeArray<_>()        
+        Body.dictionaryFun.Clear()
+        for partAST in  newAST do
+            let vars,(partialAst,context) = go partAST.FunExpr [] 
+            listPartsASTVars.Add(List.rev vars)
+            listPartsASTPartialAst.Add((partialAst :> Statement<_>))
+            listPartsASTContext.Add(context)
+            //Body.dictionaryFun.Add(partAST.FunVar.Name, partialAst)
+
+        let AST = buildFullAst (listPartsASTVars) translatedStructs (listPartsASTPartialAst) listPartsASTContext
+        AST, newAST        
   
     member this.Translate qExpr translatorOptions = 
-        let ast = translate qExpr translatorOptions
-        ast
+        let ast, newQExpr = translate qExpr translatorOptions
+        ast, newQExpr

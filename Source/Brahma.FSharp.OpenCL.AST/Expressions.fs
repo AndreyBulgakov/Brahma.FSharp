@@ -46,7 +46,7 @@ type Item<'lang>(arr:Expression<'lang>,idx:Expression<'lang>) =
 type PropertyType<'lang>=
     | Var of Variable<'lang>
     | Item of Item<'lang>
-    
+
 type Property<'lang>(property:PropertyType<'lang>) =
     inherit Expression<'lang>()
     override this.Children = []
@@ -60,6 +60,8 @@ type BOp<'lang> =
      | Pow
      | BitAnd
      | BitOr
+     | LeftShift
+     | RightShift
      | And
      | Or
      | Less
@@ -110,3 +112,16 @@ type ArrayInitializer<'lang>() =
 type ZeroArray<'lang>(length:int) =
     inherit ArrayInitializer<'lang>()
     override this.Length = length
+
+type NewStruct<'lang>(structInfo:Struct<'lang>, cArgs:List<Expression<'lang>>) =
+    inherit Expression<'lang>()
+    override this.Children = structInfo :> _ :: List.ofSeq (Seq.cast<_> cArgs)
+    member this.Struct = structInfo
+    member this.ConstructorArgs = cArgs
+
+type FieldGet<'lang>(host:Expression<'lang>, field:string) =
+    inherit Expression<'lang>()
+    override this.Children = []
+    member this.Host = host
+    member this.Field = field
+    

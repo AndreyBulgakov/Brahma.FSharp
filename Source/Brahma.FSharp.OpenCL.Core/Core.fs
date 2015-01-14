@@ -22,25 +22,23 @@ open Brahma.FSharp.OpenCL
 open OpenCL.Net
 open System
 
-//type Context = OpenCL.Net.
-//type ClNet = OpenCL.Net
-
-
 type CLCodeGenerator() =
     static member KernelName = "brahmaKernel"
     static member GenerateKernel(lambda: Expr, provider: ComputeProvider, kernel:ICLKernel, translatorOptions) =        
         let codeGenerator = new Translator.FSQuotationToOpenCLTranslator()
-        let ast = codeGenerator.Translate lambda translatorOptions
+        let ast, newLambda = codeGenerator.Translate lambda translatorOptions
         let code = Printer.AST.Print ast 
         kernel.Provider <- provider        
         kernel.Source <- kernel.Source.Append code
         kernel.SetClosures [||]
-        kernel.SetParameters []        
+        kernel.SetParameters []   
+        newLambda     
         
 type ComputeProvider with
 
     member private this.CompileQuery<'T when 'T :> ICLKernel>(lambda:Expr, translatorOptions) =
         let kernel = System.Activator.CreateInstance<'T>()        
+//        let r, newLambda = CLCodeGenerator.GenerateKernel(lambda, this, kernel, translatorOptions)
         let r = CLCodeGenerator.GenerateKernel(lambda, this, kernel, translatorOptions)
         let str = (kernel :> ICLKernel).Source.ToString()    
         let program, error = Cl.CreateProgramWithSource(this.Context, 1u, [|str|], null)
@@ -55,12 +53,14 @@ type ComputeProvider with
         let clKernel,errpr = Cl.CreateKernel(program, CLCodeGenerator.KernelName)
         (kernel :> ICLKernel).ClKernel <- clKernel
             
+//        kernel , newLambda 
         kernel            
                     
-    member this.Compile (query: Expr<'TRange ->'a> , ?_options:CompileOptions, ?translatorOptions, ?_outCode:string ref) =
-        let options = defaultArg _options this.DefaultOptions_p
+    member this.Compile (query: Expr<'TRange ->'a> , ?_options:CompileOptions, ?translatorOptions, ?_outCode:string ref, ?kernelName:string) =
+        let options = defaultArg _options ComputeProvider.DefaultOptions_p
         let tOptions = defaultArg translatorOptions []
         this.SetCompileOptions options
+//        let kernel, newQuery = this.CompileQuery<Kernel<'TRange>>(query, tOptions)
         let kernel = this.CompileQuery<Kernel<'TRange>>(query, tOptions)
         let rng = ref Unchecked.defaultof<'TRange>
         let args = ref [||]
@@ -79,11 +79,15 @@ type ComputeProvider with
                             let x = %%c |> List.ofArray
                             rng := (box x.Head) :?> 'TRange
                             args := x.Tail |> Array.ofList
+                            let brahmsRunCls = new Brahma.OpenCL.Commands.Run<_>(kernel,!rng)
+                            !args |> Array.iteri (fun i x -> brahmsRunCls.SetupArgument(1,i,x))
                             run := kernel.Run(!rng, !args)
                         @@>
                     arr
-            <@ %%(go qExpr []):'TRange ->'a @>.Compile()()
-        
+            let res = <@ %%(go qExpr []):'TRange ->'a @>.Compile()()
+            
+            res
+                    
         if _outCode.IsSome then (_outCode.Value) := (kernel :> ICLKernel).Source.ToString()
 
         kernel

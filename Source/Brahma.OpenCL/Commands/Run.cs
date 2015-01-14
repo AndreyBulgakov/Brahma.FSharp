@@ -33,7 +33,7 @@ namespace Brahma.OpenCL.Commands
         private System.IntPtr curArgSize;
         private ICLKernel kernel;
 
-        private void ArrayToMem<T>(T[] data)
+        private void ArrayToMem(object data, System.Type t)
         {
             curArgSize = _intPtrSize;
             if (kernel.Provider.AutoconfiguredBuffers.ContainsKey(data))
@@ -45,11 +45,11 @@ namespace Brahma.OpenCL.Commands
                 ErrorCode error;
                 var operations = Operations.ReadWrite;
                 var memory = Memory.Device;
-                var _elementSize = Marshal.SizeOf(typeof(T));
+                var _elementSize = Marshal.SizeOf(t);
                 var mem = Cl.CreateBuffer(kernel.Provider.Context, (MemFlags)operations | (memory == Memory.Host ? MemFlags.UseHostPtr : (MemFlags)memory | MemFlags.CopyHostPtr),
-                    (IntPtr)(_elementSize * data.Length), data, out error);
+                    (IntPtr)(_elementSize * ((Array)data).Length), data, out error);
                 curArgVal = mem;
-                mem.Pin();
+                //mem.Pin();
                 kernel.Provider.AutoconfiguredBuffers.Add(data, (Mem)mem);
                 if (error != ErrorCode.Success)
                     throw new CLException(error);
@@ -58,19 +58,16 @@ namespace Brahma.OpenCL.Commands
 
         private void ToIMem(object arg)
         {
-            
+
+            var x = arg.GetType();
+            //Console.WriteLine(x);
             var isIMem = arg is IMem;
             if (isIMem)
             {
                 curArgSize = ((IMem)arg).Size;
                 curArgVal = ((IMem)arg).Data;
-            }            
-            else if (arg is int[]) ArrayToMem<int>((int[])arg);            
-            else if (arg is Int64[]) ArrayToMem<Int64>((Int64[])arg);
-            else if (arg is float[]) ArrayToMem<float>((float[])arg);
-            else if (arg is byte[]) ArrayToMem<byte>((byte[])arg);
-            else if (arg is Int16[]) ArrayToMem<Int16>((Int16[])arg);
-            //else if (arg is Single[]) ArrayToMem<Single>((Single[])arg);
+            }
+            else if (arg.GetType().ToString().EndsWith("[]")) ArrayToMem(arg, arg.GetType().GetElementType());            
             else
             {
                 curArgSize = (System.IntPtr)System.Runtime.InteropServices.Marshal.SizeOf(arg);
@@ -79,7 +76,7 @@ namespace Brahma.OpenCL.Commands
 
         }
 
-        protected override void SetupArgument(object sender, int index, object arg)
+        public override void SetupArgument(object sender, int index, object arg)
         {
             kernel = Kernel as ICLKernel;
             ToIMem(arg);            
@@ -132,7 +129,7 @@ namespace Brahma.OpenCL.Commands
             }
         }
         
-        internal Run(IKernel kernel, TRange range)
+        public Run(IKernel kernel, TRange range)
             : base(kernel, range)
         {
                 

@@ -49,7 +49,7 @@ namespace Brahma.OpenCL
         private bool _disposed;
         private string _compileOptions = string.Empty;
 
-        private Dictionary<System.Array, Mem> _autoconfiguredBuffers = new Dictionary<System.Array, Mem>(5);
+        private Dictionary<object, Mem> _autoconfiguredBuffers = new Dictionary<object, Mem>(5);
 
         public void CloseAllBuffers()
         {
@@ -60,7 +60,7 @@ namespace Brahma.OpenCL
             _autoconfiguredBuffers.Clear();
         }
 
-        public Dictionary<System.Array, Mem> AutoconfiguredBuffers
+        public Dictionary<object, Mem> AutoconfiguredBuffers
         {
             get { return _autoconfiguredBuffers; }
         }
@@ -73,7 +73,7 @@ namespace Brahma.OpenCL
             }
         }
 
-        public CompileOptions DefaultOptions_p
+        public static CompileOptions DefaultOptions_p
         {
             get
             {
@@ -132,6 +132,7 @@ namespace Brahma.OpenCL
         {
             if (!_disposed)
             {
+                _context.Release();                
                 _context.Dispose();
                 _disposed = true;
             }
@@ -175,7 +176,7 @@ namespace Brahma.OpenCL
             var platformNameRegex = new Regex(WildcardToRegex(platformName), RegexOptions.IgnoreCase);
             Platform? currentPlatform = null;
             ErrorCode error;
-            foreach (Platform platform in Cl.GetPlatformIDs(out error))
+            foreach (var platform in Cl.GetPlatformIDs(out error))
                 if (platformNameRegex.Match(Cl.GetPlatformInfo(platform, PlatformInfo.Name, out error).ToString()).Success)
                 {
                     currentPlatform = platform;

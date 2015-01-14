@@ -36,6 +36,17 @@ type StatementBlock<'lang> (statements:ResizeArray<Statement<'lang>>)=
     inherit Statement<'lang>()
     override this.Children = []
     member this.Statements = statements    
+    member this.Remove index =
+        statements.RemoveAt index
+    member this.Append statement =
+        statements.Add statement
+    //реализовать 2 метода remove конкретный
+    //append только в конец
+   
+type Return<'lang> (expression:Expression<'lang>) =
+    inherit Statement<'lang>()
+    override this.Children = []
+    member this.Expression = expression
 
 type IfThenElse<'lang> (cond:Expression<'lang>, thenBranch:StatementBlock<'lang>, elseBranch:Option<StatementBlock<'lang>>)=
     inherit Statement<'lang>()
@@ -61,3 +72,10 @@ type WhileLoop<'lang> (cond:Expression<'lang>, whileBlock:StatementBlock<'lang>)
 type Barrier<'lang> () =
     inherit Statement<'lang>()
     override this.Children = []
+
+type FieldSet<'lang>(host:Expression<'lang>, field:string, _val:Expression<'lang>) =
+    inherit Statement<'lang>()
+    override this.Children = host :> _ :: [_val]
+    member this.Host = host
+    member this.Field = field
+    member this.Val = _val
